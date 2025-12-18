@@ -82,11 +82,30 @@ def fetch_rss_urls():
     target_items = []
     
     # 時間設定
-    NORMAL_THRESHOLD = timedelta(days=3)    # 通常モード（全てのサイト）
-    HISTORY_THRESHOLD = timedelta(days=365*5) # 過去収集モード（Yanoshin専用）
+    NORMAL_THRESHOLD = timedelta(days=3)     # 通常モード
+    HISTORY_THRESHOLD = timedelta(days=365*5) # 過去収集モード（Yanoshin新着時）
     
     current_time = datetime.now()
     
+    # -------------------------------------------------------
+    # 1. 監視銘柄リスト(watch_list.txt)の読み込み
+    # -------------------------------------------------------
+    watch_codes = set()
+    try:
+        with open('watch_list.txt', 'r', encoding='utf-8') as f:
+            for line in f:
+                # 空白除去して、4桁の数字ならリストに追加
+                code = line.strip()
+                if code.isdigit() and len(code) == 4:
+                    watch_codes.add(code)
+        if watch_codes:
+            print(f"📋 監視リスト適用中: {len(watch_codes)} 銘柄のみチェックします")
+        else:
+            print("📋 監視リストが空のため、全銘柄をチェックします")
+    except FileNotFoundError:
+        print("ℹ️ watch_list.txt がないため、全銘柄をチェックします")
+
+    # RSSソースの読み込み
     rss_sources = []
     try:
         with open('sources.json', 'r', encoding='utf-8') as f:
@@ -97,57 +116,60 @@ def fetch_rss_urls():
 
     for rss_url in rss_sources:
         try:
+            # -------------------------------------------------------
+            # 2. 事前フィルタリング (Yanoshinの場合のみ)
+            # -------------------------------------------------------
+            is_yanoshin = "tdnet/list" in rss_url
+            
+            if is_yanoshin and watch_codes:
+                # URLから銘柄コードを抽出 (例: .../list/1301.rss -> 1301)
+                match = re.search(r'/list/(\d{4})\.rss', rss_url)
+                if match:
+                    code = match.group(1)
+                    # 監視リストに載っていない銘柄は、アクセスせずにスキップ
+                    if code not in watch_codes:
+                        continue
+            
+            # -------------------------------------------------------
+            # 3. RSS取得 (ここから先は前回と同じ)
+            # -------------------------------------------------------
             res = requests.get(rss_url, headers=HEADERS, timeout=30)
             if res.status_code != 200:
                 continue
 
             feed = feedparser.parse(res.content)
             
-            # -------------------------------------------------------
-            # 1. モード判定: 「過去収集モード」を発動するか？
-            # -------------------------------------------------------
+            # モード判定
             enable_history_mode = False
             
-            # 条件A: YanoshinのURLであること (URLに 'tdnet/list' を含む)
-            is_yanoshin = "tdnet/list" in rss_url
-            
             if is_yanoshin:
-                # 条件B: 新着(3日以内)かつ重要キーワードを含む記事があるかチェック
                 for entry in feed.entries:
                     date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
                     if date_struct:
                         pub_date = datetime.fromtimestamp(mktime(date_struct))
                         
+                        # 新着(3日以内) かつ 重要キーワード
                         if (current_time - pub_date <= NORMAL_THRESHOLD) and \
                            any(k in entry.title for k in TARGET_KEYWORDS):
                             enable_history_mode = True
-                            print(f"🔥 Yanoshin新着検知: {rss_url} -> 過去データも収集します")
+                            print(f"🔥 新着検知: {rss_url} -> 過去データも収集します")
                             break
 
-            # -------------------------------------------------------
-            # 2. 閾値の決定
-            # -------------------------------------------------------
-            # Yanoshinでフラグが立った時だけ「5年」、それ以外は常に「3日」
+            # 閾値決定
             threshold = HISTORY_THRESHOLD if enable_history_mode else NORMAL_THRESHOLD
             
-            # -------------------------------------------------------
-            # 3. 記事のフィルタリングと収集
-            # -------------------------------------------------------
+            # 記事収集
             for entry in feed.entries:
                 date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
                 
                 if date_struct:
                     pub_date = datetime.fromtimestamp(mktime(date_struct))
-                    
-                    # 決定した閾値より古い記事はスキップ
                     if current_time - pub_date > threshold:
                         continue
                 else:
-                    # 日付不明な場合、過去モードでないならスキップ（安全策）
                     if not enable_history_mode:
                         continue
 
-                # キーワードチェック
                 if any(k in entry.title for k in TARGET_KEYWORDS):
                     target_items.append({
                         "url": entry.link,
@@ -156,7 +178,7 @@ def fetch_rss_urls():
                     })
 
         except Exception as e:
-            print(f"❌ RSS取得エラー ({rss_url}): {e}")
+            print(f"❌ RSS処理エラー ({rss_url}): {e}")
     
     return target_items
 
@@ -387,6 +409,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
