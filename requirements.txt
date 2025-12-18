@@ -1,4 +1,11 @@
-openai
 requests
+feedparser
 pdfplumber
-schedule
+openai
+gspread
+google-auth
+slack_sdk
+pytesseract
+pdf2image
+beautifulsoup4
+Pillow
