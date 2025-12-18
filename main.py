@@ -81,12 +81,9 @@ def fetch_rss_urls():
     print("📡 新着情報を収集中...")
     target_items = []
     
-    # 1. 期間設定
-    # 通常時: 直近1ヶ月 (サーバー停止時などのバッファ込み)
-    NORMAL_THRESHOLD = timedelta(days=30)
-    
-    # イベント検知時: 過去5年まで許容
-    HISTORY_THRESHOLD = timedelta(days=365 * 5)
+    # 時間設定
+    NORMAL_THRESHOLD = timedelta(days=3)    # 通常モード（全てのサイト）
+    HISTORY_THRESHOLD = timedelta(days=365*5) # 過去収集モード（Yanoshin専用）
     
     current_time = datetime.now()
     
@@ -100,51 +97,57 @@ def fetch_rss_urls():
 
     for rss_url in rss_sources:
         try:
-            # RSS取得 (URLパラメータの付与・加工は行わず、そのままリクエストします)
-            res = requests.get(rss_url, headers=HEADERS, timeout=200)
+            res = requests.get(rss_url, headers=HEADERS, timeout=30)
             if res.status_code != 200:
                 continue
 
             feed = feedparser.parse(res.content)
             
             # -------------------------------------------------------
-            # ステップ1: 「新着の重要イベント」が含まれているかチェック
+            # 1. モード判定: 「過去収集モード」を発動するか？
             # -------------------------------------------------------
-            hit_event_found = False
+            enable_history_mode = False
             
-            for entry in feed.entries:
-                date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
-                if date_struct:
-                    pub_date = datetime.fromtimestamp(mktime(date_struct))
-                    
-                    # 「1ヶ月以内」かつ「キーワードヒット」する記事があるか？
-                    if (current_time - pub_date <= NORMAL_THRESHOLD) and \
-                       any(k in entry.title for k in TARGET_KEYWORDS):
-                        hit_event_found = True
-                        print(f"🔥 新着検知: {entry.title[:30]}... -> 過去データの収集フィルタを開放します")
-                        break 
+            # 条件A: YanoshinのURLであること (URLに 'tdnet/list' を含む)
+            is_yanoshin = "tdnet/list" in rss_url
+            
+            if is_yanoshin:
+                # 条件B: 新着(3日以内)かつ重要キーワードを含む記事があるかチェック
+                for entry in feed.entries:
+                    date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+                    if date_struct:
+                        pub_date = datetime.fromtimestamp(mktime(date_struct))
+                        
+                        if (current_time - pub_date <= NORMAL_THRESHOLD) and \
+                           any(k in entry.title for k in TARGET_KEYWORDS):
+                            enable_history_mode = True
+                            print(f"🔥 Yanoshin新着検知: {rss_url} -> 過去データも収集します")
+                            break
+
+            # -------------------------------------------------------
+            # 2. 閾値の決定
+            # -------------------------------------------------------
+            # Yanoshinでフラグが立った時だけ「5年」、それ以外は常に「3日」
+            threshold = HISTORY_THRESHOLD if enable_history_mode else NORMAL_THRESHOLD
             
             # -------------------------------------------------------
-            # ステップ2: 収集判断 (フィルタの切り替え)
+            # 3. 記事のフィルタリングと収集
             # -------------------------------------------------------
-            # 新着があれば「5年」、なければ「1ヶ月」を閾値にする
-            threshold = HISTORY_THRESHOLD if hit_event_found else NORMAL_THRESHOLD
-            
             for entry in feed.entries:
                 date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
                 
                 if date_struct:
                     pub_date = datetime.fromtimestamp(mktime(date_struct))
                     
-                    # 決定した閾値(5年 or 1ヶ月より古い記事はスキップ)
+                    # 決定した閾値より古い記事はスキップ
                     if current_time - pub_date > threshold:
                         continue
                 else:
-                    # 日付不明なデータは、新着検知時なら念のため通す
-                    if not hit_event_found:
+                    # 日付不明な場合、過去モードでないならスキップ（安全策）
+                    if not enable_history_mode:
                         continue
 
-                # 最後にキーワードチェックしてリストに追加
+                # キーワードチェック
                 if any(k in entry.title for k in TARGET_KEYWORDS):
                     target_items.append({
                         "url": entry.link,
@@ -384,6 +387,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
