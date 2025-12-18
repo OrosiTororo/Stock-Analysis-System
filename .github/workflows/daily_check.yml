@@ -1,30 +1,30 @@
-name: 決算自動分析ボット
+name: Stock Analysis 365
 
-# いつ動かすか：15分おき、または手動実行
 on:
   schedule:
-    - cron: '*/15 * * * *' 
+    - cron: '*/30 * * * *' # 30分ごとに実行
   workflow_dispatch:
 
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
-
     steps:
-      - name: コードを取得
-        uses: actions/checkout@v3
-
-      - name: Pythonをセットアップ
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      
+      - uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
-      - name: ライブラリをインストール
+      # ▼▼▼ 追加箇所: OCRとPDFツールをOSにインストール ▼▼▼
+      - name: Install OCR dependencies
         run: |
-          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn poppler-utils
 
-      - name: 分析プログラムを実行
+      - run: pip install -r requirements.txt
+      
+      - run: python main.py
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python main.py
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
