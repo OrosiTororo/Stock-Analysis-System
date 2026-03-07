@@ -1,4 +1,4 @@
-# 📈 Stock Analysis System (365 AI監視ボット)
+# 📈 Stock-Analysis-System
 
 このシステムは、**企業の決算情報や開示ニュースを24時間自動で収集し、AIで分析してSlackに通知・Googleスプレッドシートに記録する自動監視システム**です。
 
