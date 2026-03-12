@@ -4,8 +4,13 @@ on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'テスト実行（通知・記録なし）'
+        required: false
+        type: boolean
+        default: false
 
-# 最小権限の原則: このワークフローにはリポジトリへの書き込み権限は不要
 permissions:
   contents: read
 
@@ -30,7 +35,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run stock analysis
-        run: python main.py
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python main.py --dry-run --verbose
+          else
+            python main.py
+          fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
