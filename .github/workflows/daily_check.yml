@@ -2,28 +2,45 @@ name: Stock Analysis 365
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # 30分ごとに実行
+    - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'テスト実行（通知・記録なし）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
-      
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+      - uses: actions/checkout@v4
 
-      # ▼▼▼ 追加箇所: OCRとPDFツールをOSにインストール ▼▼▼
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
       - name: Install OCR dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn poppler-utils
 
-      - run: pip install -r requirements.txt
-      
-      - run: python main.py
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stock analysis
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python main.py --dry-run --verbose
+          else
+            python main.py
+          fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
