@@ -34,5 +34,8 @@ env/
 .DS_Store
 Thumbs.db
 
+# User data
+watch_list.txt
+
 # Logs
 *.log
