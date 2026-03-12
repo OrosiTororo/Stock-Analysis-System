@@ -1,5 +1,5 @@
 {
-    "gpt_model": "gpt-4o",
+    "gpt_model": "gpt-5.2",
     "spreadsheet_name": "stock_analysis_log",
     "request_timeout_sec": 60,
     "max_content_size_mb": 50,
