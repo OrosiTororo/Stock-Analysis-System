@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import time
+import logging
 import requests
 import pdfplumber
 import feedparser
@@ -12,17 +14,40 @@ from bs4 import BeautifulSoup
 from io import BytesIO
 from datetime import datetime, timedelta
 from time import mktime
+from urllib.parse import urlparse
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
 
 # ==========================================
+# ログ設定
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# ==========================================
 # ★設定
 # ==========================================
-# サーバーにブラウザからのアクセスだと思わせるためのヘッダー
+# HTTPリクエスト用の共通ヘッダー
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'StockAnalysisBot/1.0 (+https://github.com/TroroOrosi/Stock-Analysis-System)'
 }
+
+# 許可するURLスキーム・ドメインのホワイトリスト（SSRF対策）
+ALLOWED_DOMAINS = {
+    "prtimes.jp",
+    "www.jpx.co.jp",
+    "webapi.yanoshin.jp",
+    "www.release.tdnet.info",
+    "tdnet.info",
+}
+
+# リクエストのタイムアウト（秒）
+REQUEST_TIMEOUT = 60
+MAX_CONTENT_SIZE = 50 * 1024 * 1024  # 50MB
 
 POSITIVE_WORDS = [
     "上方修正", "業績予想の修正", "営業利益率改善", "黒字転換", "赤字縮小",
@@ -55,6 +80,21 @@ if not all([OPENAI_API_KEY, SLACK_WEBHOOK_URL, GOOGLE_CREDENTIALS_JSON]):
 # ユーティリティ関数
 # ==========================================
 
+def is_allowed_url(url):
+    """URLがホワイトリストに含まれるドメインかチェック（SSRF対策）"""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname or ""
+        return any(
+            hostname == domain or hostname.endswith("." + domain)
+            for domain in ALLOWED_DOMAINS
+        )
+    except Exception:
+        return False
+
+
 def get_sheet():
     """Google Sheets接続（失敗してもNoneを返して処理を続行させる）"""
     try:
@@ -62,31 +102,45 @@ def get_sheet():
         creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON), scopes=scopes)
         return gspread.authorize(creds).open("stock_analysis_log").sheet1
     except Exception as e:
-        print(f"⚠️ スプレッドシート接続エラー: {e}")
+        logging.warning("スプレッドシート接続エラー: %s", e)
         return None
 
-def fetch_with_retry(url, retries=3):
-    """リトライ機能付きのURL取得"""
+def fetch_with_retry(url, retries=3, timeout=REQUEST_TIMEOUT):
+    """リトライ機能付きのURL取得（ホワイトリストチェック付き）"""
+    if not is_allowed_url(url):
+        logging.warning("許可されていないドメインへのアクセスをブロック: %s", urlparse(url).hostname)
+        return None
+
     for i in range(retries):
         try:
-            res = requests.get(url, headers=HEADERS, timeout=60)
+            res = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            # レスポンスサイズチェック
+            content_length = res.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_CONTENT_SIZE:
+                logging.warning("レスポンスが大きすぎます (%s bytes): %s", content_length, url)
+                return None
             res.raise_for_status()
             return res
         except Exception as e:
-            print(f"⚠️ 接続エラー({i+1}/{retries}): {url} - {e}")
-            time.sleep(2 * (i + 1)) # 指数バックオフ
+            logging.warning("接続エラー(%d/%d): %s - %s", i + 1, retries, url, e)
+            time.sleep(2 * (i + 1))
     return None
 
 def fetch_rss_urls():
-    print("📡 新着情報を収集中...")
+    logging.info("新着情報を収集中...")
     target_items = []
-    
+
     # 時間設定
     NORMAL_THRESHOLD = timedelta(days=3)     # 通常モード
     HISTORY_THRESHOLD = timedelta(days=365*5) # 過去収集モード（Yanoshin新着時）
-    
+
     current_time = datetime.now()
-    
+
     # -------------------------------------------------------
     # 1. 監視銘柄リスト(watch_list.txt)の読み込み
     # -------------------------------------------------------
@@ -94,65 +148,67 @@ def fetch_rss_urls():
     try:
         with open('watch_list.txt', 'r', encoding='utf-8') as f:
             for line in f:
-                # 空白除去して、4桁の数字ならリストに追加
                 code = line.strip()
                 if code.isdigit() and len(code) == 4:
                     watch_codes.add(code)
         if watch_codes:
-            print(f"📋 監視リスト適用中: {len(watch_codes)} 銘柄のみチェックします")
+            logging.info("監視リスト適用中: %d 銘柄のみチェックします", len(watch_codes))
         else:
-            print("📋 監視リストが空のため、全銘柄をチェックします")
+            logging.info("監視リストが空のため、全銘柄をチェックします")
     except FileNotFoundError:
-        print("ℹ️ watch_list.txt がないため、全銘柄をチェックします")
+        logging.info("watch_list.txt がないため、全銘柄をチェックします")
 
     # RSSソースの読み込み
     rss_sources = []
     try:
         with open('sources.json', 'r', encoding='utf-8') as f:
             rss_sources = json.load(f)
-    except FileNotFoundError:
-        print("⚠️ sources.json が見つかりません。")
+        if not isinstance(rss_sources, list):
+            logging.error("sources.json はURL文字列のリストである必要があります")
+            return []
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.error("sources.json の読み込み失敗: %s", e)
         return []
 
     for rss_url in rss_sources:
+        if not isinstance(rss_url, str) or not is_allowed_url(rss_url):
+            continue
+
         try:
             # -------------------------------------------------------
             # 2. 事前フィルタリング (Yanoshinの場合のみ)
             # -------------------------------------------------------
             is_yanoshin = "tdnet/list" in rss_url
-            
+
             if is_yanoshin and watch_codes:
-                # URLから銘柄コードを抽出 (例: .../list/1301.rss -> 1301)
                 match = re.search(r'/list/(\d{4})\.rss', rss_url)
                 if match:
                     code = match.group(1)
-                    # 監視リストに載っていない銘柄は、アクセスせずにスキップ
                     if code not in watch_codes:
                         continue
-            
+
             # -------------------------------------------------------
-            # 3. RSS取得 (ここから先は前回と同じ)
+            # 3. RSS取得
             # -------------------------------------------------------
-            res = requests.get(rss_url, headers=HEADERS, timeout=30)
-            if res.status_code != 200:
+            res = fetch_with_retry(rss_url, retries=2, timeout=30)
+            if not res:
                 continue
 
             feed = feedparser.parse(res.content)
-            
+
             # モード判定
             enable_history_mode = False
-            
+
             if is_yanoshin:
                 for entry in feed.entries:
                     date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
                     if date_struct:
                         pub_date = datetime.fromtimestamp(mktime(date_struct))
-                        
-                        # 新着(3日以内) かつ 重要キーワード
+
                         if (current_time - pub_date <= NORMAL_THRESHOLD) and \
-                           any(k in entry.title for k in TARGET_KEYWORDS):
+                           any(k in entry.get("title", "") for k in TARGET_KEYWORDS):
                             enable_history_mode = True
-                            print(f"🔥 新着検知: {rss_url} -> 過去データも収集します")
+                            logging.info("新着検知: %s -> 過去データも収集します", rss_url)
                             break
 
             # 閾値決定
@@ -170,27 +226,26 @@ def fetch_rss_urls():
                     if not enable_history_mode:
                         continue
 
-                if any(k in entry.title for k in TARGET_KEYWORDS):
+                title = entry.get("title", "")
+                link = entry.get("link", "")
+                if any(k in title for k in TARGET_KEYWORDS) and link:
                     target_items.append({
-                        "url": entry.link,
-                        "title": entry.title,
+                        "url": link,
+                        "title": title,
                         "date": datetime.now().strftime("%Y-%m-%d")
                     })
 
         except Exception as e:
-            print(f"❌ RSS処理エラー ({rss_url}): {e}")
+            logging.error("RSS処理エラー (%s): %s", rss_url, e)
     
     return target_items
 
 def extract_content(url):
     """PDF/HTMLからテキスト抽出（OCR対応ハイブリッド版）"""
-    print(f"📥 コンテンツ取得: {url}")
-    try:
-        # タイムアウトを少し長めに設定
-        res = requests.get(url, headers=HEADERS, timeout=60)
-        res.raise_for_status()
-    except Exception as e:
-        print(f"⚠️ ダウンロード失敗: {e}")
+    logging.info("コンテンツ取得: %s", url)
+
+    res = fetch_with_retry(url, retries=2)
+    if not res:
         return None
 
     content_type = res.headers.get('Content-Type', '').lower()
@@ -215,7 +270,7 @@ def extract_content(url):
             # ステップ2: テキストがほとんど取れない場合、画像PDFとみなしてOCRを実行
             # ---------------------------------------------------------
             if len(text_data.strip()) < 50:
-                print("⚠️ テキストレイヤー不足。OCR(画像解析)を実行します...")
+                logging.info("テキストレイヤー不足。OCR(画像解析)を実行します...")
                 try:
                     # PDFを画像データに変換 (dpi=200で精度と速度のバランスを取る)
                     images = convert_from_bytes(res.content, dpi=200)
@@ -227,10 +282,9 @@ def extract_content(url):
                         text_data += pytesseract.image_to_string(img, lang='jpn+eng') + "\n"
                         
                 except Exception as e_ocr:
-                    print(f"❌ OCR処理エラー: {e_ocr}")
-                    # TesseractやPopplerが入っていない場合のヒントを表示
+                    logging.error("OCR処理エラー: %s", e_ocr)
                     if "poppler" in str(e_ocr).lower():
-                        print("ℹ️ ヒント: OSに 'poppler-utils' のインストールが必要です。")
+                        logging.info("ヒント: OSに 'poppler-utils' のインストールが必要です。")
 
         else:
             # HTMLの場合の処理（変更なし）
@@ -243,7 +297,7 @@ def extract_content(url):
         return text_data[:400000] 
 
     except Exception as e:
-        print(f"❌ 解析エラー: {e}")
+        logging.error("解析エラー: %s", e)
         return None
 
 def check_keywords_category(text):
@@ -262,17 +316,17 @@ def check_keywords_category(text):
 
 def analyze_gpt(text, category, keywords):
     """OpenAI APIによる分析"""
-    print(f"🧠 AI分析実行中... ({category})")
+    logging.info("AI分析実行中... (%s)", category)
     client = OpenAI(api_key=OPENAI_API_KEY)
     keywords_str = ", ".join(keywords)
-    
+
     prompt = f"""
     あなたはプロの機関投資家です。以下の資料テキストから、株価への影響を分析してください。
 
     【コンテキスト】
     検出カテゴリ: {category}
     検出キーワード: {keywords_str}
-    
+
     以下のJSONフォーマットのみを出力してください。Markdownのバッククォートは不要です。
     {{
         "verdict": "強気 / 中立 / 弱気 / 要警戒",
@@ -281,7 +335,7 @@ def analyze_gpt(text, category, keywords):
         "impact": "短期的な株価インパクト予想（大/中/小）"
     }}
     """
-    
+
     try:
         res = client.chat.completions.create(
             model=GPT_MODEL,
@@ -293,9 +347,18 @@ def analyze_gpt(text, category, keywords):
             timeout=300
         )
         content = res.choices[0].message.content
-        return json.loads(content)
+        data = json.loads(content)
+        # レスポンスのバリデーション
+        expected_keys = {"verdict", "reason", "summary", "impact"}
+        if not expected_keys.issubset(data.keys()):
+            logging.warning("GPTレスポンスに必要なキーが不足: %s", data.keys())
+            return None
+        return data
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        logging.error("GPTレスポンスのパースに失敗: %s", e)
+        return None
     except Exception as e:
-        print(f"❌ GPT APIエラー: {e}")
+        logging.error("GPT APIエラー: %s", e)
         return None
 
 def notify_slack(data, item, category, hit_words):
@@ -326,33 +389,29 @@ def notify_slack(data, item, category, hit_words):
     try:
         webhook.send(text=f"分析完了: {item['title']}", blocks=blocks, attachments=[{"color": color}])
     except Exception as e:
-        print(f"❌ Slack送信エラー: {e}")
+        logging.error("Slack送信エラー: %s", e)
 
 # ==========================================
 # メイン処理
 # ==========================================
 def main():
-    print(f"--- 株式監視システム起動: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
-    
+    logging.info("--- 株式監視システム起動 ---")
+
     # 1. 処理済みURLのロード (Setを使って高速化)
     processed_urls = set()
     sheet = get_sheet()
-    
+
     if sheet:
         try:
-            # I列(9列目)にあるURL一覧を取得
             existing_urls = sheet.col_values(9)
-            processed_urls = set(existing_urls) # 重複排除してSetへ
+            processed_urls = set(existing_urls)
         except Exception as e:
-            print(f"⚠️ 履歴読み込み失敗: {e}")
+            logging.warning("履歴読み込み失敗: %s", e)
 
     # 2. RSSからURL収集
     target_items = fetch_rss_urls()
     
-    # デバッグ用: 強制的にテスト用URLを追加したい場合はここで追加
-    # target_items.append({"url": "...", "title": "テスト", "date": "2024..."})
-
-    print(f"🔍 {len(target_items)} 件の記事をチェックします...")
+    logging.info("%d 件の記事をチェックします...", len(target_items))
 
     for item in target_items:
         url = item['url']
@@ -372,7 +431,7 @@ def main():
         is_hit, category, hit_words = check_keywords_category(text)
         
         if is_hit:
-            print(f"✅ HIT: {item['title']} -> {category}")
+            logging.info("HIT: %s -> %s", item['title'], category)
             
             # 5. GPT分析
             analysis = analyze_gpt(text, category, hit_words)
@@ -395,9 +454,9 @@ def main():
                             url
                         ])
                     except Exception as e:
-                        print(f"⚠️ シート記録エラー: {e}")
+                        logging.warning("シート記録エラー: %s", e)
         else:
-            print(f"Pass (キーワードなし): {item['title']}")
+            logging.debug("Pass (キーワードなし): %s", item['title'])
         
         # 処理済みリストに追加
         processed_urls.add(url)
@@ -405,14 +464,10 @@ def main():
         # APIレート制限とサーバー負荷軽減のため少し待機
         time.sleep(2)
 
-    print("--- 処理完了 ---")
+    logging.info("--- 処理完了 ---")
 
 if __name__ == "__main__":
     main()
-
-
-
-
 
 
 
