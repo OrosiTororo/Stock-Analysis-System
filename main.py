@@ -5,11 +5,14 @@ import json
 import time
 import logging
 import argparse
+import smtplib
 import requests
 import pdfplumber
 import feedparser
 import gspread
 import pytesseract
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pdf2image import convert_from_bytes
 from PIL import Image
 from bs4 import BeautifulSoup
@@ -18,8 +21,6 @@ from datetime import datetime, timedelta
 from time import mktime
 from urllib.parse import urlparse
 from google.oauth2.service_account import Credentials
-from openai import OpenAI
-from slack_sdk.webhook import WebhookClient
 
 # ==========================================
 # ログ設定
@@ -33,15 +34,24 @@ logging.basicConfig(
 # ==========================================
 # 設定の読み込み
 # ==========================================
-# デフォルト設定（config.json がない場合のフォールバック）
 DEFAULT_CONFIG = {
-    "gpt_model": "gpt-4o",
+    "llm_provider": "openai",
+    "openai_model": "gpt-4o",
+    "ollama_base_url": "http://localhost:11434",
+    "ollama_model": "qwen3:8b",
+    "anthropic_model": "claude-sonnet-4-20250514",
+    "google_model": "gemini-2.0-flash",
     "spreadsheet_name": "stock_analysis_log",
     "request_timeout_sec": 60,
     "max_content_size_mb": 50,
     "rss_check_days": 3,
     "history_check_years": 5,
     "sleep_between_items_sec": 2,
+    "notification_channels": ["slack"],
+    "email_smtp_server": "smtp.gmail.com",
+    "email_smtp_port": 587,
+    "email_use_tls": True,
+    "email_to": [],
     "target_keywords": ["決算", "修正", "配当", "短信", "報告書", "中期経営計画"],
     "positive_words": [
         "上方修正", "業績予想の修正", "営業利益率改善", "黒字転換", "赤字縮小",
@@ -331,57 +341,155 @@ def check_keywords_category(text, positive_words, negative_words):
 
 
 # ==========================================
-# GPT分析
+# LLM分析（マルチプロバイダー対応）
 # ==========================================
-def analyze_gpt(text, category, keywords, model):
+ANALYSIS_PROMPT = """あなたはプロの機関投資家です。以下の資料テキストから、株価への影響を分析してください。
+
+【コンテキスト】
+検出カテゴリ: {category}
+検出キーワード: {keywords_str}
+
+以下のJSONフォーマットのみを出力してください。Markdownのバッククォートは不要です。
+{{
+    "verdict": "強気 / 中立 / 弱気 / 要警戒",
+    "reason": "判断の根拠（簡潔に）",
+    "summary": "内容の要約（3行以内）",
+    "impact": "短期的な株価インパクト予想（大/中/小）"
+}}"""
+
+
+def _analyze_openai(text, prompt, model):
     """OpenAI APIによる分析"""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         logging.error("OPENAI_API_KEY が設定されていません")
         return None
 
-    logging.info("AI分析実行中... (%s / model=%s)", category, model)
+    from openai import OpenAI
     client = OpenAI(api_key=api_key)
+
+    res = client.chat.completions.create(
+        model=model,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
+        timeout=300,
+    )
+    return res.choices[0].message.content
+
+
+def _analyze_ollama(text, prompt, config):
+    """Ollama（ローカルLLM）による分析 - データは外部に送信されません"""
+    base_url = config.get("ollama_base_url", "http://localhost:11434")
+    model = config.get("ollama_model", "qwen3:8b")
+
+    logging.info("Ollama ローカルLLM使用中 (model=%s) - データは外部送信されません", model)
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
+        "stream": False,
+        "format": "json",
+    }
+
+    res = requests.post(
+        f"{base_url}/api/chat",
+        json=payload,
+        timeout=600,
+    )
+    res.raise_for_status()
+    data = res.json()
+    return data.get("message", {}).get("content", "")
+
+
+def _analyze_anthropic(text, prompt, model):
+    """Anthropic Claude APIによる分析"""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        logging.error("ANTHROPIC_API_KEY が設定されていません")
+        return None
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+
+    res = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=prompt,
+        messages=[
+            {"role": "user", "content": text},
+        ],
+    )
+    return res.content[0].text
+
+
+def _analyze_google(text, prompt, model):
+    """Google Gemini APIによる分析"""
+    api_key = os.environ.get("GOOGLE_AI_API_KEY")
+    if not api_key:
+        logging.error("GOOGLE_AI_API_KEY が設定されていません")
+        return None
+
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+
+    gen_model = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=prompt,
+        generation_config={"response_mime_type": "application/json"},
+    )
+    res = gen_model.generate_content(text)
+    return res.text
+
+
+def analyze_llm(text, category, keywords, config):
+    """マルチプロバイダー対応のLLM分析エントリーポイント"""
+    provider = config.get("llm_provider", "openai")
     keywords_str = ", ".join(keywords)
+    prompt = ANALYSIS_PROMPT.format(category=category, keywords_str=keywords_str)
 
-    prompt = f"""
-    あなたはプロの機関投資家です。以下の資料テキストから、株価への影響を分析してください。
-
-    【コンテキスト】
-    検出カテゴリ: {category}
-    検出キーワード: {keywords_str}
-
-    以下のJSONフォーマットのみを出力してください。Markdownのバッククォートは不要です。
-    {{
-        "verdict": "強気 / 中立 / 弱気 / 要警戒",
-        "reason": "判断の根拠（簡潔に）",
-        "summary": "内容の要約（3行以内）",
-        "impact": "短期的な株価インパクト予想（大/中/小）"
-    }}
-    """
+    logging.info("AI分析実行中... (provider=%s, カテゴリ=%s)", provider, category)
 
     try:
-        res = client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
-            ],
-            timeout=300,
-        )
-        content = res.choices[0].message.content
+        if provider == "openai":
+            model = config.get("openai_model", "gpt-4o")
+            content = _analyze_openai(text, prompt, model)
+        elif provider == "ollama":
+            content = _analyze_ollama(text, prompt, config)
+        elif provider == "anthropic":
+            model = config.get("anthropic_model", "claude-sonnet-4-20250514")
+            content = _analyze_anthropic(text, prompt, model)
+        elif provider == "google":
+            model = config.get("google_model", "gemini-2.0-flash")
+            content = _analyze_google(text, prompt, model)
+        else:
+            logging.error("未対応のLLMプロバイダー: %s", provider)
+            return None
+
+        if not content:
+            return None
+
         data = json.loads(content)
         expected_keys = {"verdict", "reason", "summary", "impact"}
         if not expected_keys.issubset(data.keys()):
-            logging.warning("GPTレスポンスに必要なキーが不足: %s", data.keys())
+            logging.warning("LLMレスポンスに必要なキーが不足: %s", data.keys())
             return None
         return data
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error("GPTレスポンスのパースに失敗: %s", e)
+
+    except json.JSONDecodeError as e:
+        logging.error("LLMレスポンスのパースに失敗: %s (raw: %s)", e, content[:200] if content else "empty")
+        return None
+    except requests.ConnectionError:
+        logging.error("Ollamaサーバーに接続できません。Ollamaが起動しているか確認してください: %s",
+                      config.get("ollama_base_url", "http://localhost:11434"))
         return None
     except Exception as e:
-        logging.error("GPT APIエラー: %s", e)
+        logging.error("LLM APIエラー (%s): %s", provider, e)
         return None
 
 
@@ -395,6 +503,7 @@ def notify_slack(data, item, category, hit_words):
         logging.error("SLACK_WEBHOOK_URL が設定されていません")
         return
 
+    from slack_sdk.webhook import WebhookClient
     webhook = WebhookClient(webhook_url)
 
     color = "#808080"
@@ -426,6 +535,88 @@ def notify_slack(data, item, category, hit_words):
 
 
 # ==========================================
+# メール通知
+# ==========================================
+def notify_email(data, item, category, hit_words, config):
+    """メール通知送信（SMTP）"""
+    smtp_user = os.environ.get("EMAIL_SMTP_USER")
+    smtp_password = os.environ.get("EMAIL_SMTP_PASSWORD")
+    if not smtp_user or not smtp_password:
+        logging.error("EMAIL_SMTP_USER / EMAIL_SMTP_PASSWORD が設定されていません")
+        return
+
+    recipients = config.get("email_to", [])
+    if not recipients:
+        logging.warning("メール送信先 (email_to) が設定されていません")
+        return
+
+    smtp_server = config.get("email_smtp_server", "smtp.gmail.com")
+    smtp_port = config.get("email_smtp_port", 587)
+    use_tls = config.get("email_use_tls", True)
+
+    verdict = data.get("verdict", "不明")
+    verdict_emoji = {"強気": "📈", "弱気": "📉", "要警戒": "⚠️"}.get(verdict, "📊")
+
+    subject = f"{verdict_emoji} [{verdict}] {item['title'][:60]}"
+
+    body = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 株式開示情報 AI分析レポート
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+■ タイトル: {item['title']}
+■ AI判断: {verdict}
+■ カテゴリ: {category}
+■ インパクト: {data.get('impact', '不明')}
+
+【根拠】
+{data.get('reason', 'N/A')}
+
+【要約】
+{data.get('summary', 'N/A')}
+
+【検出キーワード】
+{', '.join(hit_words[:10])}
+
+【原文URL】
+{item['url']}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+※ このメールは Stock-Analysis-System により自動送信されています。
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+        if use_tls:
+            server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, recipients, msg.as_string())
+        server.quit()
+        logging.info("メール送信完了: %s -> %s", subject[:40], ", ".join(recipients))
+    except Exception as e:
+        logging.error("メール送信エラー: %s", e)
+
+
+# ==========================================
+# 通知ディスパッチャー
+# ==========================================
+def send_notifications(data, item, category, hit_words, config):
+    """設定に基づき、有効な通知チャンネルすべてに送信する"""
+    channels = config.get("notification_channels", ["slack"])
+
+    if "slack" in channels:
+        notify_slack(data, item, category, hit_words)
+
+    if "email" in channels:
+        notify_email(data, item, category, hit_words, config)
+
+
+# ==========================================
 # メイン処理
 # ==========================================
 def main():
@@ -433,7 +624,7 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="テスト実行（Slack通知・スプレッドシート記録をスキップ）",
+        help="テスト実行（通知・記録をスキップ）",
     )
     parser.add_argument(
         "--config",
@@ -444,6 +635,12 @@ def main():
         "--verbose",
         action="store_true",
         help="デバッグログを表示",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["openai", "ollama", "anthropic", "google"],
+        default=None,
+        help="LLMプロバイダーを指定（config.jsonより優先）",
     )
     args = parser.parse_args()
 
@@ -456,7 +653,12 @@ def main():
 
     # 設定読み込み
     config = load_config(args.config)
-    gpt_model = config.get("gpt_model", "gpt-4o")
+
+    # CLIからのプロバイダー指定はconfigより優先
+    if args.provider:
+        config["llm_provider"] = args.provider
+
+    provider = config.get("llm_provider", "openai")
     spreadsheet_name = config.get("spreadsheet_name", "stock_analysis_log")
     timeout = config.get("request_timeout_sec", 60)
     max_size = config.get("max_content_size_mb", 50) * 1024 * 1024
@@ -464,8 +666,23 @@ def main():
     positive_words = config.get("positive_words", [])
     negative_words = config.get("negative_words", [])
 
-    # 環境変数チェック（dry-runでなければ必須）
-    required_vars = ["OPENAI_API_KEY", "SLACK_WEBHOOK_URL", "GOOGLE_CREDENTIALS_JSON"]
+    # 環境変数チェック（プロバイダーに応じて必須項目が変わる）
+    required_vars = []
+    if provider == "openai":
+        required_vars.append("OPENAI_API_KEY")
+    elif provider == "anthropic":
+        required_vars.append("ANTHROPIC_API_KEY")
+    elif provider == "google":
+        required_vars.append("GOOGLE_AI_API_KEY")
+    # ollama はローカルなのでAPIキー不要
+
+    notification_channels = config.get("notification_channels", ["slack"])
+    if "slack" in notification_channels:
+        required_vars.append("SLACK_WEBHOOK_URL")
+    if "email" in notification_channels:
+        required_vars.extend(["EMAIL_SMTP_USER", "EMAIL_SMTP_PASSWORD"])
+
+    # Google Sheets は任意（設定があれば使用）
     missing = [v for v in required_vars if not os.environ.get(v)]
     if missing and not dry_run:
         raise SystemExit(f"エラー: 環境変数が未設定です: {', '.join(missing)}\n"
@@ -473,7 +690,7 @@ def main():
     elif missing:
         logging.warning("未設定の環境変数があります（ドライランのため続行）: %s", ", ".join(missing))
 
-    logging.info("--- 株式監視システム起動 ---")
+    logging.info("--- 株式監視システム起動 (LLM: %s) ---", provider)
 
     # RSSソースを読み込んで許可ドメインリストを構築
     rss_sources = []
@@ -522,9 +739,9 @@ def main():
                              item["title"], category, ", ".join(hit_words[:5]))
                 analyzed_count += 1
             else:
-                analysis = analyze_gpt(text, category, hit_words, model=gpt_model)
+                analysis = analyze_llm(text, category, hit_words, config)
                 if analysis:
-                    notify_slack(analysis, item, category, hit_words)
+                    send_notifications(analysis, item, category, hit_words, config)
                     analyzed_count += 1
 
                     if sheet:

@@ -10,6 +10,15 @@ on:
         required: false
         type: boolean
         default: false
+      provider:
+        description: 'LLMプロバイダー（空欄でconfig.jsonの設定を使用）'
+        required: false
+        type: choice
+        options:
+          - ''
+          - openai
+          - anthropic
+          - google
 
 permissions:
   contents: read
@@ -36,12 +45,19 @@ jobs:
 
       - name: Run stock analysis
         run: |
+          ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            python main.py --dry-run --verbose
-          else
-            python main.py
+            ARGS="$ARGS --dry-run --verbose"
           fi
+          if [ -n "${{ github.event.inputs.provider }}" ]; then
+            ARGS="$ARGS --provider ${{ github.event.inputs.provider }}"
+          fi
+          python main.py $ARGS
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
