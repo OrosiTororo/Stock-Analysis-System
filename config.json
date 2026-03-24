@@ -1,11 +1,21 @@
 {
-    "gpt_model": "gpt-5.2",
+    "llm_provider": "openai",
+    "openai_model": "gpt-4o",
+    "ollama_base_url": "http://localhost:11434",
+    "ollama_model": "qwen3:8b",
+    "anthropic_model": "claude-sonnet-4-20250514",
+    "google_model": "gemini-2.0-flash",
     "spreadsheet_name": "stock_analysis_log",
     "request_timeout_sec": 60,
     "max_content_size_mb": 50,
     "rss_check_days": 3,
     "history_check_years": 5,
     "sleep_between_items_sec": 2,
+    "notification_channels": ["slack"],
+    "email_smtp_server": "smtp.gmail.com",
+    "email_smtp_port": 587,
+    "email_use_tls": true,
+    "email_to": [],
     "target_keywords": [
         "決算", "修正", "配当", "短信", "報告書", "中期経営計画"
     ],
