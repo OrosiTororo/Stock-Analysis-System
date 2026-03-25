@@ -1,8 +1,8 @@
 import os
 import re
-import sys
 import json
 import time
+import ipaddress
 import logging
 import argparse
 import smtplib
@@ -14,7 +14,6 @@ import pytesseract
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pdf2image import convert_from_bytes
-from PIL import Image
 from bs4 import BeautifulSoup
 from io import BytesIO
 from datetime import datetime, timedelta
@@ -89,6 +88,18 @@ def load_config(config_path):
         logging.info("config.json が見つかりません。デフォルト設定を使用します")
     except json.JSONDecodeError as e:
         logging.warning("config.json のパースに失敗しました: %s デフォルト設定を使用します", e)
+
+    # 設定値のバリデーション
+    valid_providers = {"openai", "ollama", "anthropic", "google"}
+    if config.get("llm_provider") not in valid_providers:
+        logging.warning("不正な llm_provider: %s。デフォルト 'openai' を使用します", config.get("llm_provider"))
+        config["llm_provider"] = "openai"
+    for key in ("request_timeout_sec", "max_content_size_mb", "rss_check_days",
+                "history_check_years", "sleep_between_items_sec"):
+        if not isinstance(config.get(key), (int, float)) or config[key] <= 0:
+            logging.warning("不正な設定値 %s=%s。デフォルト値を使用します", key, config.get(key))
+            config[key] = DEFAULT_CONFIG[key]
+
     return config
 
 
@@ -101,7 +112,7 @@ def build_allowed_domains(config, rss_sources):
                 hostname = urlparse(url).hostname
                 if hostname:
                     domains.add(hostname)
-            except Exception:
+            except (ValueError, AttributeError):
                 pass
     return domains
 
@@ -114,6 +125,15 @@ HEADERS = {
 }
 
 
+def _is_private_ip(hostname):
+    """ホスト名がプライベートIPアドレスかどうかを判定する（SSRF対策）"""
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local
+    except ValueError:
+        return False
+
+
 def is_allowed_url(url, allowed_domains):
     """URLがホワイトリストに含まれるドメインかチェック（SSRF対策）"""
     try:
@@ -121,11 +141,14 @@ def is_allowed_url(url, allowed_domains):
         if parsed.scheme not in ("http", "https"):
             return False
         hostname = parsed.hostname or ""
+        if _is_private_ip(hostname):
+            logging.warning("プライベートIPアドレスへのアクセスをブロック: %s", hostname)
+            return False
         return any(
             hostname == domain or hostname.endswith("." + domain)
             for domain in allowed_domains
         )
-    except Exception:
+    except (ValueError, AttributeError):
         return False
 
 
@@ -146,10 +169,13 @@ def fetch_with_retry(url, allowed_domains, retries=3, timeout=60, max_size=50 * 
                 return None
 
             content_length = res.headers.get("Content-Length")
-            if content_length and int(content_length) > max_size:
-                logging.warning("レスポンスが大きすぎます (%s bytes): %s", content_length, url)
-                res.close()
-                return None
+            try:
+                if content_length and int(content_length) > max_size:
+                    logging.warning("レスポンスが大きすぎます (%s bytes): %s", content_length, url)
+                    res.close()
+                    return None
+            except (ValueError, TypeError):
+                logging.debug("Content-Lengthヘッダーが不正: %s", content_length)
 
             # ストリーミングで実際のサイズを制限しながら読み込み
             chunks = []
@@ -161,11 +187,14 @@ def fetch_with_retry(url, allowed_domains, retries=3, timeout=60, max_size=50 * 
                     res.close()
                     return None
                 chunks.append(chunk)
-            res._content = b"".join(chunks)
 
+            # レスポンスオブジェクトの代わりに、必要な属性を持つラッパーを使用
+            content = b"".join(chunks)
             res.raise_for_status()
+            # ストリーミング完了後にcontentプロパティを利用可能にする
+            res._content = content
             return res
-        except Exception as e:
+        except requests.RequestException as e:
             logging.warning("接続エラー(%d/%d): %s - %s", i + 1, retries, url, e)
             time.sleep(2 * (i + 1))
     return None
@@ -191,10 +220,14 @@ def get_sheet(spreadsheet_name):
 # ==========================================
 # RSS収集
 # ==========================================
-def fetch_rss_urls(config, allowed_domains):
+def fetch_rss_urls(config, allowed_domains, rss_sources):
     """RSSフィードから対象記事のURLを収集する"""
     logging.info("新着情報を収集中...")
     target_items = []
+
+    if not rss_sources:
+        logging.warning("RSSソースが空です")
+        return []
 
     rss_check_days = config.get("rss_check_days", 3)
     history_years = config.get("history_check_years", 5)
@@ -217,18 +250,6 @@ def fetch_rss_urls(config, allowed_domains):
             logging.info("監視リストが空のため、全銘柄をチェックします")
     except FileNotFoundError:
         logging.info("watch_list.txt がないため、全銘柄をチェックします")
-
-    # RSSソース読み込み
-    rss_sources = []
-    try:
-        with open("sources.json", "r", encoding="utf-8") as f:
-            rss_sources = json.load(f)
-        if not isinstance(rss_sources, list):
-            logging.error("sources.json はURL文字列のリストである必要があります")
-            return []
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logging.error("sources.json の読み込み失敗: %s", e)
-        return []
 
     for rss_url in rss_sources:
         if not isinstance(rss_url, str) or not is_allowed_url(rss_url, allowed_domains):
@@ -284,7 +305,7 @@ def fetch_rss_urls(config, allowed_domains):
                         "date": datetime.now().strftime("%Y-%m-%d"),
                     })
 
-        except Exception as e:
+        except (requests.RequestException, ValueError, KeyError) as e:
             logging.error("RSS処理エラー (%s): %s", rss_url, e)
 
     return target_items
@@ -310,7 +331,7 @@ def extract_content(url, allowed_domains, timeout=60, max_size=50 * 1024 * 1024)
         if is_pdf:
             with pdfplumber.open(BytesIO(res.content)) as pdf:
                 for i, p in enumerate(pdf.pages):
-                    if i > 100:
+                    if i >= 100:
                         break
                     extracted = p.extract_text()
                     if extracted:
@@ -322,7 +343,7 @@ def extract_content(url, allowed_domains, timeout=60, max_size=50 * 1024 * 1024)
                 try:
                     images = convert_from_bytes(res.content, dpi=200)
                     for i, img in enumerate(images):
-                        if i > 5:
+                        if i >= 5:
                             break
                         text_data += pytesseract.image_to_string(img, lang="jpn+eng") + "\n"
                 except Exception as e_ocr:
@@ -398,6 +419,9 @@ def _analyze_openai(text, prompt, model):
         ],
         timeout=300,
     )
+    if not res.choices:
+        logging.warning("OpenAI: レスポンスにchoicesが含まれていません")
+        return None
     return res.choices[0].message.content
 
 
@@ -421,7 +445,7 @@ def _analyze_ollama(text, prompt, config):
     res = requests.post(
         f"{base_url}/api/chat",
         json=payload,
-        timeout=600,
+        timeout=300,
     )
     res.raise_for_status()
     data = res.json()
@@ -446,6 +470,9 @@ def _analyze_anthropic(text, prompt, model):
             {"role": "user", "content": text},
         ],
     )
+    if not res.content:
+        logging.warning("Anthropic: レスポンスにcontentが含まれていません")
+        return None
     return res.content[0].text
 
 
@@ -503,7 +530,7 @@ def analyze_llm(text, category, keywords, config):
         return data
 
     except json.JSONDecodeError as e:
-        logging.error("LLMレスポンスのパースに失敗: %s (raw: %s)", e, content[:200] if content else "empty")
+        logging.error("LLMレスポンスのパースに失敗: %s (length: %d)", e, len(content) if content else 0)
         return None
     except requests.ConnectionError:
         logging.error("Ollamaサーバーに接続できません。Ollamaが起動しているか確認してください: %s",
@@ -718,8 +745,13 @@ def main():
     try:
         with open("sources.json", "r", encoding="utf-8") as f:
             rss_sources = json.load(f)
-    except Exception:
-        pass
+        if not isinstance(rss_sources, list):
+            logging.error("sources.json はURL文字列のリストである必要があります")
+            rss_sources = []
+    except FileNotFoundError:
+        logging.error("sources.json が見つかりません")
+    except json.JSONDecodeError as e:
+        logging.error("sources.json のパースに失敗: %s", e)
     allowed_domains = build_allowed_domains(config, rss_sources)
     logging.debug("許可ドメイン: %s", allowed_domains)
 
@@ -731,12 +763,12 @@ def main():
         if sheet:
             try:
                 existing_urls = sheet.col_values(9)
-                processed_urls = set(existing_urls)
+                processed_urls = {u for u in existing_urls if u}
             except Exception as e:
                 logging.warning("履歴読み込み失敗: %s", e)
 
     # RSS収集
-    target_items = fetch_rss_urls(config, allowed_domains)
+    target_items = fetch_rss_urls(config, allowed_domains, rss_sources)
     logging.info("%d 件の記事をチェックします...", len(target_items))
 
     analyzed_count = 0
@@ -766,20 +798,29 @@ def main():
                     analyzed_count += 1
 
                     if sheet:
-                        try:
-                            sheet.append_row([
-                                datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                item["title"],
-                                analysis.get("verdict"),
-                                analysis.get("summary"),
-                                analysis.get("reason"),
-                                analysis.get("impact"),
-                                category,
-                                "Success",
-                                url,
-                            ])
-                        except Exception as e:
-                            logging.warning("シート記録エラー: %s", e)
+                        row_data = [
+                            datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            item["title"],
+                            analysis.get("verdict"),
+                            analysis.get("summary"),
+                            analysis.get("reason"),
+                            analysis.get("impact"),
+                            category,
+                            "Success",
+                            url,
+                        ]
+                        for attempt in range(3):
+                            try:
+                                sheet.append_row(row_data)
+                                break
+                            except Exception as e:
+                                if attempt < 2:
+                                    logging.warning("シート記録リトライ (%d/3): %s", attempt + 1, e)
+                                    time.sleep(2 * (attempt + 1))
+                                else:
+                                    logging.error("シート記録失敗（全リトライ失敗）: %s", e)
+                else:
+                    logging.warning("LLM分析がNullを返しました: %s", item["title"])
         else:
             logging.debug("Pass (キーワードなし): %s", item["title"])
 
