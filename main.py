@@ -137,11 +137,32 @@ def fetch_with_retry(url, allowed_domains, retries=3, timeout=60, max_size=50 * 
 
     for i in range(retries):
         try:
-            res = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            res = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=True)
+
+            # リダイレクト先がホワイトリスト外でないか検証（SSRF対策）
+            if not is_allowed_url(res.url, allowed_domains):
+                logging.warning("リダイレクト先が許可されていないドメインです: %s -> %s", url, res.url)
+                res.close()
+                return None
+
             content_length = res.headers.get("Content-Length")
             if content_length and int(content_length) > max_size:
                 logging.warning("レスポンスが大きすぎます (%s bytes): %s", content_length, url)
+                res.close()
                 return None
+
+            # ストリーミングで実際のサイズを制限しながら読み込み
+            chunks = []
+            downloaded = 0
+            for chunk in res.iter_content(chunk_size=8192):
+                downloaded += len(chunk)
+                if downloaded > max_size:
+                    logging.warning("ダウンロードサイズが上限を超えました (%d bytes): %s", downloaded, url)
+                    res.close()
+                    return None
+                chunks.append(chunk)
+            res._content = b"".join(chunks)
+
             res.raise_for_status()
             return res
         except Exception as e:
