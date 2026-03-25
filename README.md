@@ -68,6 +68,13 @@ stock-analysis-system/          ← (システム本体)
 *   **`google_model`**: Gemini使用時のモデル名
 *   **`notification_channels`**: 通知先の配列（`["slack"]`, `["email"]`, `["slack", "email"]`）
 *   **`email_to`**: メール送信先アドレスの配列
+*   **`spreadsheet_name`**: Google Sheetsのスプレッドシート名（デフォルト: `"stock_analysis_log"`）
+*   **`request_timeout_sec`**: HTTPリクエストのタイムアウト秒数（デフォルト: `60`）
+*   **`max_content_size_mb`**: ダウンロードの最大サイズ（MB）（デフォルト: `50`）
+*   **`rss_check_days`**: 通常モードで新着チェックする日数（デフォルト: `3`）
+*   **`history_check_years`**: 過去データ収集モード時の対象年数（デフォルト: `5`）
+*   **`sleep_between_items_sec`**: 記事間のスリープ秒数（デフォルト: `2`）
+*   **`allowed_domains`**: アクセスを許可するドメインのホワイトリスト
 
 #### 3. `watch_list.txt`
 **監視したい企業の銘柄コード（4桁）を指定するリスト**です。
@@ -317,9 +324,11 @@ python main.py --provider ollama --dry-run --verbose
 ### セキュリティ対策
 
 - **SSRF防止**: ホワイトリスト方式でアクセス先ドメインを制限
+- **リダイレクト検証**: リダイレクト先URLもホワイトリストで検証し、SSRF迂回を防止
 - **APIキー保護**: `.env` ファイルは `.gitignore` で除外済み
 - **環境変数管理**: GitHub Secrets または `.env` でキーを管理
-- **サイズ制限**: ダウンロードサイズの上限設定でメモリ攻撃を防止
+- **サイズ制限**: ストリーミング読み込みで実際のダウンロードサイズを制限し、メモリ攻撃を防止
+- **ページ数制限**: PDF解析は最大100ページ、OCRは最大5ページに制限
 
 ---
 
@@ -476,6 +485,13 @@ stock-analysis-system/          ← (Project root)
 *   **`google_model`**: Model name when using Gemini
 *   **`notification_channels`**: Notification targets (`["slack"]`, `["email"]`, `["slack", "email"]`)
 *   **`email_to`**: Array of email recipient addresses
+*   **`spreadsheet_name`**: Google Sheets spreadsheet name (default: `"stock_analysis_log"`)
+*   **`request_timeout_sec`**: HTTP request timeout in seconds (default: `60`)
+*   **`max_content_size_mb`**: Maximum download size in MB (default: `50`)
+*   **`rss_check_days`**: Number of days to check for new items in normal mode (default: `3`)
+*   **`history_check_years`**: Number of years for historical data collection mode (default: `5`)
+*   **`sleep_between_items_sec`**: Sleep duration between items in seconds (default: `2`)
+*   **`allowed_domains`**: Whitelist of allowed access domains
 
 #### 3. `watch_list.txt`
 **A list of 4-digit stock codes for companies you want to monitor.**
@@ -725,9 +741,11 @@ python main.py --provider ollama --dry-run --verbose
 ### Security Measures
 
 - **SSRF Prevention**: Whitelist-based access domain restrictions
+- **Redirect Verification**: Redirect destination URLs are also validated against the whitelist to prevent SSRF bypass
 - **API Key Protection**: `.env` file is excluded via `.gitignore`
 - **Env Variable Management**: Keys managed via GitHub Secrets or `.env`
-- **Size Limits**: Download size caps to prevent memory attacks
+- **Size Limits**: Streaming downloads with actual size enforcement to prevent memory attacks
+- **Page Limits**: PDF parsing is limited to 100 pages; OCR is limited to 5 pages
 
 ---
 
@@ -884,6 +902,13 @@ stock-analysis-system/          ← （项目根目录）
 *   **`google_model`**：使用Gemini时的模型名称
 *   **`notification_channels`**：通知渠道数组（`["slack"]`、`["email"]`、`["slack", "email"]`）
 *   **`email_to`**：邮件接收地址数组
+*   **`spreadsheet_name`**：Google Sheets电子表格名称（默认：`"stock_analysis_log"`）
+*   **`request_timeout_sec`**：HTTP请求超时秒数（默认：`60`）
+*   **`max_content_size_mb`**：最大下载大小（MB）（默认：`50`）
+*   **`rss_check_days`**：普通模式下检查新数据的天数（默认：`3`）
+*   **`history_check_years`**：历史数据采集模式的目标年数（默认：`5`）
+*   **`sleep_between_items_sec`**：文章间的休眠秒数（默认：`2`）
+*   **`allowed_domains`**：允许访问的域名白名单
 
 #### 3. `watch_list.txt`
 **指定要监控的企业股票代码（4位数字）列表。**
@@ -1133,9 +1158,11 @@ python main.py --provider ollama --dry-run --verbose
 ### 安全措施
 
 - **SSRF防护**：通过白名单方式限制可访问的域名
+- **重定向验证**：重定向目标URL也会通过白名单验证，防止SSRF绕过
 - **API密钥保护**：`.env` 文件已在 `.gitignore` 中排除
 - **环境变量管理**：通过GitHub Secrets或 `.env` 管理密钥
-- **大小限制**：设置下载大小上限以防止内存攻击
+- **大小限制**：通过流式下载限制实际下载大小，防止内存攻击
+- **页数限制**：PDF解析最多100页，OCR最多5页
 
 ---
 
