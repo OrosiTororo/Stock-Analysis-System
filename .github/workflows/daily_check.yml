@@ -46,14 +46,16 @@ jobs:
       - name: Run stock analysis
         run: |
           ARGS=""
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+          if [ "$INPUT_DRY_RUN" = "true" ]; then
             ARGS="$ARGS --dry-run --verbose"
           fi
-          if [ -n "${{ github.event.inputs.provider }}" ]; then
-            ARGS="$ARGS --provider ${{ github.event.inputs.provider }}"
+          if [ -n "$INPUT_PROVIDER" ]; then
+            ARGS="$ARGS --provider $INPUT_PROVIDER"
           fi
           python main.py $ARGS
         env:
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_PROVIDER: ${{ github.event.inputs.provider }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}

@@ -121,7 +121,7 @@ def build_allowed_domains(config, rss_sources):
 # HTTPリクエスト
 # ==========================================
 HEADERS = {
-    "User-Agent": "StockAnalysisBot/1.0 (+https://github.com/TroroOrosi/Stock-Analysis-System)"
+    "User-Agent": "StockAnalysisBot/1.0 (+https://github.com/OrosiTororo/Stock-Analysis-System)"
 }
 
 
