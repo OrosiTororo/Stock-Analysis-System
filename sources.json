@@ -1,10 +1,14 @@
 {
     "version": 2,
-    "description": "株式分析システム - 情報ソース設定ファイル",
+    "description": "株式分析システム - 情報ソース設定ファイル（グローバル対応版）",
     "tdnet_auto_generate": {
         "enabled": true,
-        "description": "watch_list.txt の銘柄コードから TDNet RSS を自動生成（全銘柄モードの場合は内蔵リストを使用）",
+        "description": "watch_list.txt の東証銘柄コードから TDNet RSS を自動生成",
         "base_url": "https://webapi.yanoshin.jp/webapi/tdnet/list/{code}.rss?limit=1000"
+    },
+    "global_news": {
+        "enabled": true,
+        "description": "グローバル銘柄のニュースは watch_list.txt のティッカーから自動生成される Google News / Yahoo Finance RSS を使用"
     },
     "categories": {
         "exchange": {

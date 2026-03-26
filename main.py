@@ -20,6 +20,11 @@ from datetime import datetime, timedelta
 from time import mktime
 from urllib.parse import urlparse
 from google.oauth2.service_account import Credentials
+from global_stock_fetcher import (
+    parse_watch_list,
+    fetch_global_stock_info,
+    build_global_analysis_prompt,
+)
 
 # ==========================================
 # ログ設定
@@ -69,7 +74,27 @@ DEFAULT_CONFIG = {
         "webapi.yanoshin.jp",
         "www.release.tdnet.info",
         "tdnet.info",
+        "news.google.com",
+        "feeds.finance.yahoo.com",
+        "efts.sec.gov",
+        "data.sec.gov",
+        "www.sec.gov",
     ],
+    "positive_words_en": [
+        "beat expectations", "record revenue", "raised guidance", "upward revision",
+        "strong growth", "exceeded estimates", "dividend increase", "buyback",
+        "share repurchase", "margin expansion", "outperform", "upgrade",
+        "beat consensus", "positive surprise", "accelerating growth",
+    ],
+    "negative_words_en": [
+        "missed expectations", "lowered guidance", "downward revision", "revenue decline",
+        "profit warning", "restructuring", "layoffs", "debt concern",
+        "dilution", "secondary offering", "downgrade", "underperform",
+        "negative surprise", "decelerating growth", "margin compression",
+    ],
+    "global_stock_enabled": True,
+    "news_check_days": 7,
+    "global_analysis_sleep_sec": 3,
 }
 
 
@@ -601,6 +626,212 @@ def analyze_llm(text, category, keywords, config):
         return None
 
 
+def analyze_global_stock(analysis_context, analysis_prompt, config):
+    """グローバル銘柄の包括分析（ニュース・財務・トレンドを含む）"""
+    provider = config.get("llm_provider", "openai")
+
+    logging.info("グローバル銘柄AI分析実行中... (provider=%s)", provider)
+
+    try:
+        if provider == "openai":
+            model = config.get("openai_model", "gpt-4o")
+            content = _analyze_openai(analysis_context, analysis_prompt, model)
+        elif provider == "ollama":
+            content = _analyze_ollama(analysis_context, analysis_prompt, config)
+        elif provider == "anthropic":
+            model = config.get("anthropic_model", "claude-sonnet-4-20250514")
+            content = _analyze_anthropic(analysis_context, analysis_prompt, model)
+        elif provider == "google":
+            model = config.get("google_model", "gemini-2.0-flash")
+            content = _analyze_google(analysis_context, analysis_prompt, model)
+        else:
+            logging.error("未対応のLLMプロバイダー: %s", provider)
+            return None
+
+        if not content:
+            return None
+
+        data = json.loads(content)
+        expected_keys = {"verdict", "reason", "summary", "impact"}
+        if not expected_keys.issubset(data.keys()):
+            logging.warning("LLMレスポンスに必要なキーが不足: %s", data.keys())
+            return None
+        return data
+
+    except json.JSONDecodeError as e:
+        logging.error("LLMレスポンスのパースに失敗: %s", e)
+        return None
+    except Exception as e:
+        logging.error("グローバル銘柄分析エラー: %s", e)
+        return None
+
+
+# ==========================================
+# グローバル銘柄 Slack通知
+# ==========================================
+def notify_slack_global(data, ticker_info, stock_data):
+    """グローバル銘柄のSlack通知送信"""
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        logging.error("SLACK_WEBHOOK_URL が設定されていません")
+        return
+
+    from slack_sdk.webhook import WebhookClient
+    webhook = WebhookClient(webhook_url)
+
+    ticker = ticker_info["ticker"]
+    market = ticker_info.get("market", "US")
+    company = stock_data.get("company_name", ticker) if stock_data else ticker
+    verdict = data.get("verdict", "不明")
+
+    color = "#808080"
+    if verdict == "強気":
+        color = "#36a64f"
+    elif verdict in ["弱気", "要警戒"]:
+        color = "#ff0000"
+
+    # 株価情報サマリー
+    price_info = ""
+    if stock_data and stock_data.get("current_price"):
+        price_info = f"💰 {stock_data['current_price']} {stock_data.get('currency', '')}"
+        if stock_data.get("price_change_1m") is not None:
+            change = stock_data["price_change_1m"]
+            emoji = "📈" if change > 0 else "📉" if change < 0 else "➡️"
+            price_info += f" | 1M: {emoji} {change:+.2f}%"
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"🌐 {company} ({ticker}:{market})"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*AI判断:* {verdict}"},
+            {"type": "mrkdwn", "text": f"*トレンド:* {data.get('trend', 'N/A')}"},
+        ]},
+    ]
+
+    if price_info:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": price_info}})
+
+    blocks.extend([
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*【根拠】*\n{data.get('reason', 'N/A')}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*【要約】*\n{data.get('summary', 'N/A')}"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*短期見通し:* {data.get('outlook_short', 'N/A')}"},
+            {"type": "mrkdwn", "text": f"*中期見通し:* {data.get('outlook_medium', 'N/A')}"},
+        ]},
+        {"type": "section", "text": {
+            "type": "mrkdwn",
+            "text": f"*ニュースセンチメント:* {data.get('news_sentiment', 'N/A')} | *リスク:* {data.get('risks', 'N/A')}"
+        }},
+        {"type": "context", "elements": [
+            {"type": "mrkdwn", "text": f"インパクト: {data.get('impact', 'N/A')} | 注目指標: {data.get('key_metrics', 'N/A')[:100]}"},
+        ]},
+    ])
+
+    try:
+        webhook.send(
+            text=f"グローバル銘柄分析: {company} ({ticker}) - {verdict}",
+            blocks=blocks,
+            attachments=[{"color": color}],
+        )
+    except Exception as e:
+        logging.error("Slack送信エラー (グローバル): %s", e)
+
+
+def notify_email_global(data, ticker_info, stock_data, config):
+    """グローバル銘柄のメール通知送信"""
+    smtp_user = os.environ.get("EMAIL_SMTP_USER")
+    smtp_password = os.environ.get("EMAIL_SMTP_PASSWORD")
+    if not smtp_user or not smtp_password:
+        logging.error("EMAIL_SMTP_USER / EMAIL_SMTP_PASSWORD が設定されていません")
+        return
+
+    recipients = config.get("email_to", [])
+    if not recipients:
+        logging.warning("メール送信先 (email_to) が設定されていません")
+        return
+
+    smtp_server = config.get("email_smtp_server", "smtp.gmail.com")
+    smtp_port = config.get("email_smtp_port", 587)
+    use_tls = config.get("email_use_tls", True)
+
+    ticker = ticker_info["ticker"]
+    market = ticker_info.get("market", "US")
+    company = stock_data.get("company_name", ticker) if stock_data else ticker
+    verdict = data.get("verdict", "不明")
+    verdict_emoji = {"強気": "📈", "弱気": "📉", "要警戒": "⚠️"}.get(verdict, "📊")
+
+    subject = f"{verdict_emoji} [{verdict}] {company} ({ticker}:{market}) 分析レポート"
+
+    price_section = ""
+    if stock_data and stock_data.get("current_price"):
+        price_section = f"""
+■ 現在株価: {stock_data['current_price']} {stock_data.get('currency', '')}
+■ 時価総額: {stock_data.get('market_cap', 'N/A')}
+■ PER: {stock_data.get('pe_ratio', 'N/A')}
+"""
+
+    body = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌐 グローバル銘柄 AI分析レポート
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+■ 銘柄: {company} ({ticker}:{market})
+■ AI判断: {verdict}
+■ トレンド: {data.get('trend', 'N/A')}
+■ インパクト: {data.get('impact', 'N/A')}
+{price_section}
+【根拠】
+{data.get('reason', 'N/A')}
+
+【要約】
+{data.get('summary', 'N/A')}
+
+【短期見通し】
+{data.get('outlook_short', 'N/A')}
+
+【中期見通し】
+{data.get('outlook_medium', 'N/A')}
+
+【ニュースセンチメント】
+{data.get('news_sentiment', 'N/A')}
+
+【リスク要因】
+{data.get('risks', 'N/A')}
+
+【注目指標】
+{data.get('key_metrics', 'N/A')}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+※ このメールは Stock-Analysis-System により自動送信されています。
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+        if use_tls:
+            server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, recipients, msg.as_string())
+        server.quit()
+        logging.info("メール送信完了 (グローバル): %s", subject[:50])
+    except Exception as e:
+        logging.error("メール送信エラー (グローバル): %s", e)
+
+
+def send_global_notifications(data, ticker_info, stock_data, config):
+    """グローバル銘柄の通知を全チャンネルに送信する"""
+    channels = config.get("notification_channels", ["slack"])
+
+    if "slack" in channels:
+        notify_slack_global(data, ticker_info, stock_data)
+
+    if "email" in channels:
+        notify_email_global(data, ticker_info, stock_data, config)
+
+
 # ==========================================
 # Slack通知
 # ==========================================
@@ -877,7 +1108,107 @@ def main():
         processed_urls.add(url)
         time.sleep(sleep_sec)
 
-    logging.info("--- 処理完了 (分析件数: %d / 対象: %d) ---", analyzed_count, len(target_items))
+    logging.info("--- 東証銘柄処理完了 (分析件数: %d / 対象: %d) ---", analyzed_count, len(target_items))
+
+    # ==========================================
+    # グローバル銘柄分析パイプライン
+    # ==========================================
+    global_enabled = config.get("global_stock_enabled", True)
+    if not global_enabled:
+        logging.info("グローバル銘柄分析は無効です (global_stock_enabled=false)")
+    else:
+        _, global_tickers = parse_watch_list("watch_list.txt")
+
+        if not global_tickers:
+            logging.info("グローバル銘柄がwatch_listに登録されていません")
+        else:
+            logging.info("=== グローバル銘柄分析開始 (%d 銘柄) ===", len(global_tickers))
+            global_sleep = config.get("global_analysis_sleep_sec", 3)
+            global_analyzed = 0
+
+            for ticker_info in global_tickers:
+                ticker = ticker_info["ticker"]
+                market = ticker_info.get("market", "US")
+
+                try:
+                    # 全情報取得（株価・ニュース・SEC資料）
+                    result = fetch_global_stock_info(ticker_info, config)
+
+                    if not result or not result.get("analysis_context"):
+                        logging.warning("データ取得失敗: %s:%s", ticker, market)
+                        continue
+
+                    stock_data = result.get("stock_data")
+                    news_count = len(result.get("news", []))
+                    sec_count = len(result.get("sec_filings", []))
+                    logging.info(
+                        "データ取得完了: %s (ニュース=%d件, SEC=%d件)",
+                        ticker, news_count, sec_count,
+                    )
+
+                    if dry_run:
+                        logging.info(
+                            "[ドライラン] グローバル分析スキップ: %s:%s (ニュース=%d, SEC=%d)",
+                            ticker, market, news_count, sec_count,
+                        )
+                        global_analyzed += 1
+                    else:
+                        # LLM分析実行
+                        analysis = analyze_global_stock(
+                            result["analysis_context"],
+                            result["analysis_prompt"],
+                            config,
+                        )
+
+                        if analysis:
+                            # 通知送信
+                            send_global_notifications(analysis, ticker_info, stock_data, config)
+                            global_analyzed += 1
+
+                            # Google Sheets記録
+                            if sheet:
+                                row_data = [
+                                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                    f"[Global] {stock_data.get('company_name', ticker)} ({ticker}:{market})",
+                                    analysis.get("verdict"),
+                                    analysis.get("summary"),
+                                    analysis.get("reason"),
+                                    analysis.get("impact"),
+                                    f"トレンド: {analysis.get('trend', 'N/A')}",
+                                    "Success",
+                                    f"global:{ticker}:{market}",
+                                ]
+                                for attempt in range(3):
+                                    try:
+                                        sheet.append_row(row_data)
+                                        break
+                                    except Exception as e:
+                                        if attempt < 2:
+                                            logging.warning("シート記録リトライ (%d/3): %s", attempt + 1, e)
+                                            time.sleep(2 * (attempt + 1))
+                                        else:
+                                            logging.error("シート記録失敗: %s", e)
+
+                            logging.info(
+                                "✓ %s:%s -> %s (トレンド: %s)",
+                                ticker, market,
+                                analysis.get("verdict"),
+                                analysis.get("trend", "N/A"),
+                            )
+                        else:
+                            logging.warning("LLM分析失敗: %s:%s", ticker, market)
+
+                except Exception as e:
+                    logging.error("グローバル銘柄処理エラー (%s:%s): %s", ticker, market, e)
+
+                time.sleep(global_sleep)
+
+            logging.info(
+                "=== グローバル銘柄処理完了 (分析件数: %d / 対象: %d) ===",
+                global_analyzed, len(global_tickers),
+            )
+
+    logging.info("--- 全処理完了 ---")
 
 
 if __name__ == "__main__":
