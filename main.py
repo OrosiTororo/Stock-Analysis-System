@@ -117,6 +117,66 @@ def build_allowed_domains(config, rss_sources):
     return domains
 
 
+def load_sources_file(sources_path="sources.json"):
+    """sources.json を読み込み、URLリストを返す（v2構造化形式・旧形式の両方に対応）"""
+    try:
+        with open(sources_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logging.error("sources.json が見つかりません")
+        return []
+    except json.JSONDecodeError as e:
+        logging.error("sources.json のパースに失敗: %s", e)
+        return []
+
+    # 旧形式（URL配列）
+    if isinstance(data, list):
+        logging.info("sources.json: 旧形式 (%d URLs)", len(data))
+        return [u for u in data if isinstance(u, str)]
+
+    # 新形式（v2構造化）
+    if isinstance(data, dict) and data.get("version") == 2:
+        urls = []
+        categories = data.get("categories", {})
+        for cat_key, cat_data in categories.items():
+            if not cat_data.get("enabled", True):
+                logging.debug("カテゴリ無効: %s", cat_key)
+                continue
+            for source in cat_data.get("sources", []):
+                if source.get("enabled", True):
+                    urls.append(source["url"])
+
+        # TDNet自動生成
+        tdnet_conf = data.get("tdnet_auto_generate", {})
+        if tdnet_conf.get("enabled", False):
+            base_url = tdnet_conf.get(
+                "base_url",
+                "https://webapi.yanoshin.jp/webapi/tdnet/list/{code}.rss?limit=1000"
+            )
+            watch_codes = []
+            try:
+                with open("watch_list.txt", "r", encoding="utf-8") as f:
+                    for line in f:
+                        code = line.strip()
+                        if code.isdigit() and len(code) == 4:
+                            watch_codes.append(code)
+            except FileNotFoundError:
+                pass
+
+            if watch_codes:
+                for code in watch_codes:
+                    urls.append(base_url.format(code=code))
+                logging.info("TDNet自動生成: %d 銘柄", len(watch_codes))
+            else:
+                logging.info("TDNet自動生成: watch_list.txt 未設定のため、スキップ")
+
+        logging.info("sources.json: v2形式 (%d URLs, %d カテゴリ)", len(urls), len(categories))
+        return urls
+
+    logging.error("sources.json の形式が不正です")
+    return []
+
+
 # ==========================================
 # HTTPリクエスト
 # ==========================================
@@ -741,17 +801,7 @@ def main():
     logging.info("--- 株式監視システム起動 (LLM: %s) ---", provider)
 
     # RSSソースを読み込んで許可ドメインリストを構築
-    rss_sources = []
-    try:
-        with open("sources.json", "r", encoding="utf-8") as f:
-            rss_sources = json.load(f)
-        if not isinstance(rss_sources, list):
-            logging.error("sources.json はURL文字列のリストである必要があります")
-            rss_sources = []
-    except FileNotFoundError:
-        logging.error("sources.json が見つかりません")
-    except json.JSONDecodeError as e:
-        logging.error("sources.json のパースに失敗: %s", e)
+    rss_sources = load_sources_file("sources.json")
     allowed_domains = build_allowed_domains(config, rss_sources)
     logging.debug("許可ドメイン: %s", allowed_domains)
 
