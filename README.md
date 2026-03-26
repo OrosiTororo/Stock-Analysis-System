@@ -33,6 +33,9 @@ stock-analysis-system/          ← (システム本体)
 │
 ├── main.py                     ← ★プログラムの本体 (ロジックの中枢)
 │
+├── global_stock_fetcher.py     ← グローバル銘柄（米国株・欧州株等）のデータ取得・分析モジュール
+├── source_manager.py           ← 情報ソース管理CLIツール
+│
 ├── config.json                 ← 設定ファイル (LLMプロバイダー・キーワード・通知先等)
 │
 ├── sources.json                ← 収集するRSSのURL一覧 (サンプル)
@@ -77,7 +80,7 @@ stock-analysis-system/          ← (システム本体)
 *   **`allowed_domains`**: アクセスを許可するドメインのホワイトリスト
 
 #### 3. `watch_list.txt`
-**監視したい企業の銘柄コード（4桁）を指定するリスト**です。
+**監視したい銘柄を指定するリスト（東証4桁コード、米国株ティッカー、市場指定付きティッカーに対応）**です。
 
 *   ここにコード（例: `1301`）を書くと、指定した銘柄のYanoshin RSSだけをチェックします。
 *   **空の場合:** 全てのRSSをチェックします。
@@ -450,6 +453,9 @@ stock-analysis-system/          ← (Project root)
 │
 ├── main.py                     ← ★ Main application (core logic)
 │
+├── global_stock_fetcher.py     ← Global stock (US, EU, etc.) data fetching & analysis module
+├── source_manager.py           ← Information source management CLI tool
+│
 ├── config.json                 ← Configuration file (LLM provider, keywords, notification targets, etc.)
 │
 ├── sources.json                ← List of RSS feed URLs to collect from (sample)
@@ -494,7 +500,7 @@ stock-analysis-system/          ← (Project root)
 *   **`allowed_domains`**: Whitelist of allowed access domains
 
 #### 3. `watch_list.txt`
-**A list of 4-digit stock codes for companies you want to monitor.**
+**A list of stock codes/tickers to monitor (supports TSE 4-digit codes, US tickers like AAPL, and market-specified tickers like VOW3:DE).**
 
 *   Adding a code (e.g., `1301`) limits Yanoshin RSS checks to only those stocks.
 *   **If empty:** All RSS feeds are checked.
@@ -867,6 +873,9 @@ stock-analysis-system/          ← （项目根目录）
 │
 ├── main.py                     ← ★ 主程序（核心逻辑）
 │
+├── global_stock_fetcher.py     ← 全球股票（美股、欧股等）数据获取与分析模块
+├── source_manager.py           ← 信息源管理CLI工具
+│
 ├── config.json                 ← 配置文件（LLM提供商、关键词、通知目标等）
 │
 ├── sources.json                ← 待采集的RSS源URL列表（示例）
@@ -911,7 +920,7 @@ stock-analysis-system/          ← （项目根目录）
 *   **`allowed_domains`**：允许访问的域名白名单
 
 #### 3. `watch_list.txt`
-**指定要监控的企业股票代码（4位数字）列表。**
+**指定要监控的股票代码/ticker列表（支持东证4位代码、美股ticker如AAPL、带市场指定的ticker如VOW3:DE、0700:HK等）。**
 
 *   添加代码（如 `1301`）后，只会检查该股票的Yanoshin RSS。
 *   **为空时：** 检查所有RSS源。

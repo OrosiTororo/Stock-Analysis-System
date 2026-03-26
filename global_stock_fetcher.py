@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
 HEADERS = {
-    "User-Agent": "StockAnalysisBot/2.0 (+https://github.com/TroroOrosi/Stock-Analysis-System)"
+    "User-Agent": "StockAnalysisBot/2.0 (+https://github.com/OrosiTororo/Stock-Analysis-System)"
 }
 
 
@@ -350,35 +350,13 @@ def fetch_sec_filings(ticker_info, max_filings=5):
     logging.info("SEC EDGAR 決算資料検索中: %s", ticker)
 
     try:
-        # EDGAR Full-Text Search API
-        search_url = "https://efts.sec.gov/LATEST/search-index"
-        params = {
-            "q": f"\"{ticker}\"",
-            "dateRange": "custom",
-            "startdt": (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"),
-            "enddt": datetime.now().strftime("%Y-%m-%d"),
-            "forms": "10-K,10-Q,8-K,6-K,20-F",
-        }
-
-        # EDGAR XBRL Company Facts API (CIK lookup)
-        cik_url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&forms=10-K,10-Q"
-
         # EDGAR company search
         headers = {
-            "User-Agent": "StockAnalysisBot research@example.com",
+            "User-Agent": "StockAnalysisBot/2.0 research@example.com",
             "Accept": "application/json",
         }
 
-        search_api_url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&forms=10-K,10-Q,8-K&dateRange=custom&startdt={(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')}&enddt={datetime.now().strftime('%Y-%m-%d')}"
-
-        # Use EDGAR full text search API
-        edgar_search_url = (
-            f"https://efts.sec.gov/LATEST/search-index"
-            f"?q=%22{ticker}%22"
-            f"&forms=10-K,10-Q,8-K"
-        )
-
-        # Simpler approach: use EDGAR company tickers JSON
+        # Use EDGAR company tickers JSON
         tickers_url = "https://www.sec.gov/files/company_tickers.json"
         res = requests.get(tickers_url, headers=headers, timeout=30)
         if res.status_code != 200:
