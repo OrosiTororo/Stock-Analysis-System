@@ -526,7 +526,7 @@ def cmd_validate(args):
     import requests as req
 
     data = load_sources(args.file)
-    headers = {"User-Agent": "StockAnalysisBot/1.0 SourceValidator"}
+    headers = {"User-Agent": "StockAnalysisBot/2.0 (+https://github.com/OrosiTororo/Stock-Analysis-System)"}
 
     print("\n🔍 ソース接続テスト中...\n")
     results = {"ok": 0, "fail": 0, "skip": 0}

@@ -206,7 +206,7 @@ def load_sources_file(sources_path="sources.json"):
 # HTTPリクエスト
 # ==========================================
 HEADERS = {
-    "User-Agent": "StockAnalysisBot/1.0 (+https://github.com/TroroOrosi/Stock-Analysis-System)"
+    "User-Agent": "StockAnalysisBot/2.0 (+https://github.com/OrosiTororo/Stock-Analysis-System)"
 }
 
 
