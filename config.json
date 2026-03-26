@@ -30,11 +30,31 @@
         "特殊要因", "外部環境", "為替影響", "原材料高", "一過性要因", "先行投資",
         "想定外", "希薄化", "第三者割当", "MSワラント", "CB", "新株予約権", "支配株主"
     ],
+    "positive_words_en": [
+        "beat expectations", "record revenue", "raised guidance", "upward revision",
+        "strong growth", "exceeded estimates", "dividend increase", "buyback",
+        "share repurchase", "margin expansion", "outperform", "upgrade",
+        "beat consensus", "positive surprise", "accelerating growth"
+    ],
+    "negative_words_en": [
+        "missed expectations", "lowered guidance", "downward revision", "revenue decline",
+        "profit warning", "restructuring", "layoffs", "debt concern",
+        "dilution", "secondary offering", "downgrade", "underperform",
+        "negative surprise", "decelerating growth", "margin compression"
+    ],
     "allowed_domains": [
         "prtimes.jp",
         "www.jpx.co.jp",
         "webapi.yanoshin.jp",
         "www.release.tdnet.info",
-        "tdnet.info"
-    ]
+        "tdnet.info",
+        "news.google.com",
+        "feeds.finance.yahoo.com",
+        "efts.sec.gov",
+        "data.sec.gov",
+        "www.sec.gov"
+    ],
+    "global_stock_enabled": true,
+    "news_check_days": 7,
+    "global_analysis_sleep_sec": 3
 }

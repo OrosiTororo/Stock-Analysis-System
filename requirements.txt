@@ -11,3 +11,4 @@ pytesseract>=0.3.10
 pdf2image>=1.16.0
 beautifulsoup4>=4.12.0
 Pillow>=10.0.0
+yfinance>=0.2.0
