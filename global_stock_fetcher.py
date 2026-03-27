@@ -19,6 +19,26 @@ HEADERS = {
     "User-Agent": "StockAnalysisBot/2.0 (+https://github.com/OrosiTororo/Stock-Analysis-System)"
 }
 
+# SEC EDGAR requires a legitimate contact email in the User-Agent
+SEC_EDGAR_CONTACT = os.environ.get("SEC_EDGAR_EMAIL", "")
+
+# ティッカーシンボルのバリデーション正規表現
+_TICKER_PATTERN = re.compile(r"^[A-Z0-9]{1,10}$")
+_MARKET_PATTERN = re.compile(r"^[A-Z]{2}$")
+
+
+# ==========================================
+# 入力バリデーション
+# ==========================================
+def _validate_ticker(ticker):
+    """ティッカーシンボルが安全な文字列かバリデーションする"""
+    return bool(_TICKER_PATTERN.match(ticker))
+
+
+def _validate_market(market):
+    """市場コードが安全な文字列かバリデーションする"""
+    return bool(_MARKET_PATTERN.match(market))
+
 
 # ==========================================
 # 銘柄コード判定
@@ -46,23 +66,29 @@ def parse_watch_list(watch_list_path="watch_list.txt"):
                     ticker, market = code.split(":", 1)
                     ticker = ticker.strip().upper()
                     market = market.strip().upper()
+                    if not _validate_market(market):
+                        logging.warning("不正な市場コードをスキップ: %s", code)
+                        continue
                     if market == "JP" and ticker.isdigit() and len(ticker) == 4:
                         tse_codes.append(ticker)
-                    else:
+                    elif _validate_ticker(ticker) or ticker.isdigit():
                         global_tickers.append({
                             "ticker": ticker,
                             "market": market,
                             "raw": code,
                         })
+                    else:
+                        logging.warning("不正なティッカーをスキップ: %s", code)
                 elif code.isdigit() and len(code) == 4:
                     tse_codes.append(code)
-                else:
-                    # 英字のみ → グローバルティッカーとして扱う
+                elif _validate_ticker(code.upper()):
                     global_tickers.append({
                         "ticker": code.upper(),
                         "market": "US",  # デフォルトは米国市場
                         "raw": code,
                     })
+                else:
+                    logging.warning("不正なティッカーをスキップ: %s", code)
 
     except FileNotFoundError:
         logging.info("watch_list.txt が見つかりません")
@@ -349,10 +375,14 @@ def fetch_sec_filings(ticker_info, max_filings=5):
 
     logging.info("SEC EDGAR 決算資料検索中: %s", ticker)
 
+    if not SEC_EDGAR_CONTACT:
+        logging.info("SEC_EDGAR_EMAIL が未設定のため、SEC EDGAR へのアクセスをスキップします")
+        return []
+
     try:
-        # EDGAR company search
+        # EDGAR company search (SEC requires legitimate contact info)
         headers = {
-            "User-Agent": "StockAnalysisBot/2.0 research@example.com",
+            "User-Agent": f"StockAnalysisBot/2.0 {SEC_EDGAR_CONTACT}",
             "Accept": "application/json",
         }
 

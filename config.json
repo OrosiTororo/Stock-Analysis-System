@@ -56,5 +56,6 @@
     ],
     "global_stock_enabled": true,
     "news_check_days": 7,
-    "global_analysis_sleep_sec": 3
+    "global_analysis_sleep_sec": 3,
+    "global_fetch_workers": 4
 }

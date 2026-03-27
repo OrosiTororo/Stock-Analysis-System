@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import socket
 import ipaddress
 import logging
 import argparse
@@ -19,6 +20,7 @@ from io import BytesIO
 from datetime import datetime, timedelta
 from time import mktime
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
 from global_stock_fetcher import (
     parse_watch_list,
@@ -219,6 +221,23 @@ def _is_private_ip(hostname):
         return False
 
 
+def _resolves_to_private_ip(hostname):
+    """DNS解決後のIPアドレスがプライベートかチェック（DNSリバインディング対策）"""
+    try:
+        addrinfos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, _, _, _, sockaddr in addrinfos:
+            ip_str = sockaddr[0]
+            addr = ipaddress.ip_address(ip_str)
+            if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+                logging.warning(
+                    "DNS解決先がプライベートIPです: %s -> %s", hostname, ip_str
+                )
+                return True
+        return False
+    except (socket.gaierror, ValueError, OSError):
+        return False
+
+
 def is_allowed_url(url, allowed_domains):
     """URLがホワイトリストに含まれるドメインかチェック（SSRF対策）"""
     try:
@@ -228,6 +247,8 @@ def is_allowed_url(url, allowed_domains):
         hostname = parsed.hostname or ""
         if _is_private_ip(hostname):
             logging.warning("プライベートIPアドレスへのアクセスをブロック: %s", hostname)
+            return False
+        if _resolves_to_private_ip(hostname):
             return False
         return any(
             hostname == domain or hostname.endswith("." + domain)
@@ -580,90 +601,87 @@ def _analyze_google(text, prompt, model):
     return res.text
 
 
+def _call_llm_provider(text, prompt, config):
+    """LLMプロバイダーにリクエストを送信する（共通処理）"""
+    provider = config.get("llm_provider", "openai")
+
+    if provider == "openai":
+        model = config.get("openai_model", "gpt-4o")
+        return _analyze_openai(text, prompt, model)
+    elif provider == "ollama":
+        return _analyze_ollama(text, prompt, config)
+    elif provider == "anthropic":
+        model = config.get("anthropic_model", "claude-sonnet-4-20250514")
+        return _analyze_anthropic(text, prompt, model)
+    elif provider == "google":
+        model = config.get("google_model", "gemini-2.0-flash")
+        return _analyze_google(text, prompt, model)
+    else:
+        logging.error("未対応のLLMプロバイダー: %s", provider)
+        return None
+
+
+def _call_llm_with_retry(text, prompt, config, label="LLM分析", max_retries=3):
+    """リトライ付きLLM呼び出し（指数バックオフ）"""
+    provider = config.get("llm_provider", "openai")
+    expected_keys = {"verdict", "reason", "summary", "impact"}
+
+    for attempt in range(max_retries):
+        try:
+            logging.info("%s実行中... (provider=%s, 試行=%d/%d)", label, provider, attempt + 1, max_retries)
+
+            content = _call_llm_provider(text, prompt, config)
+            if not content:
+                if attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)
+                    logging.warning("%s: 空レスポンス。%d秒後にリトライ", label, wait)
+                    time.sleep(wait)
+                    continue
+                return None
+
+            data = json.loads(content)
+            if not expected_keys.issubset(data.keys()):
+                logging.warning("LLMレスポンスに必要なキーが不足: %s", data.keys())
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                return None
+            return data
+
+        except json.JSONDecodeError as e:
+            logging.warning("LLMレスポンスのパースに失敗 (試行%d): %s", attempt + 1, e)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            logging.error("LLMレスポンスのパースに全リトライ失敗")
+            return None
+
+        except requests.ConnectionError:
+            logging.error("Ollamaサーバーに接続できません: %s",
+                          config.get("ollama_base_url", "http://localhost:11434"))
+            return None
+
+        except Exception as e:
+            logging.warning("%sエラー (試行%d/%d): %s", label, attempt + 1, max_retries, e)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            logging.error("%s: 全リトライ失敗 (%s)", label, e)
+            return None
+
+    return None
+
+
 def analyze_llm(text, category, keywords, config):
     """マルチプロバイダー対応のLLM分析エントリーポイント"""
-    provider = config.get("llm_provider", "openai")
     keywords_str = ", ".join(keywords)
     prompt = ANALYSIS_PROMPT.format(category=category, keywords_str=keywords_str)
-
-    logging.info("AI分析実行中... (provider=%s, カテゴリ=%s)", provider, category)
-
-    try:
-        if provider == "openai":
-            model = config.get("openai_model", "gpt-4o")
-            content = _analyze_openai(text, prompt, model)
-        elif provider == "ollama":
-            content = _analyze_ollama(text, prompt, config)
-        elif provider == "anthropic":
-            model = config.get("anthropic_model", "claude-sonnet-4-20250514")
-            content = _analyze_anthropic(text, prompt, model)
-        elif provider == "google":
-            model = config.get("google_model", "gemini-2.0-flash")
-            content = _analyze_google(text, prompt, model)
-        else:
-            logging.error("未対応のLLMプロバイダー: %s", provider)
-            return None
-
-        if not content:
-            return None
-
-        data = json.loads(content)
-        expected_keys = {"verdict", "reason", "summary", "impact"}
-        if not expected_keys.issubset(data.keys()):
-            logging.warning("LLMレスポンスに必要なキーが不足: %s", data.keys())
-            return None
-        return data
-
-    except json.JSONDecodeError as e:
-        logging.error("LLMレスポンスのパースに失敗: %s (length: %d)", e, len(content) if content else 0)
-        return None
-    except requests.ConnectionError:
-        logging.error("Ollamaサーバーに接続できません。Ollamaが起動しているか確認してください: %s",
-                      config.get("ollama_base_url", "http://localhost:11434"))
-        return None
-    except Exception as e:
-        logging.error("LLM APIエラー (%s): %s", provider, e)
-        return None
+    return _call_llm_with_retry(text, prompt, config, label=f"AI分析 (カテゴリ={category})")
 
 
 def analyze_global_stock(analysis_context, analysis_prompt, config):
     """グローバル銘柄の包括分析（ニュース・財務・トレンドを含む）"""
-    provider = config.get("llm_provider", "openai")
-
-    logging.info("グローバル銘柄AI分析実行中... (provider=%s)", provider)
-
-    try:
-        if provider == "openai":
-            model = config.get("openai_model", "gpt-4o")
-            content = _analyze_openai(analysis_context, analysis_prompt, model)
-        elif provider == "ollama":
-            content = _analyze_ollama(analysis_context, analysis_prompt, config)
-        elif provider == "anthropic":
-            model = config.get("anthropic_model", "claude-sonnet-4-20250514")
-            content = _analyze_anthropic(analysis_context, analysis_prompt, model)
-        elif provider == "google":
-            model = config.get("google_model", "gemini-2.0-flash")
-            content = _analyze_google(analysis_context, analysis_prompt, model)
-        else:
-            logging.error("未対応のLLMプロバイダー: %s", provider)
-            return None
-
-        if not content:
-            return None
-
-        data = json.loads(content)
-        expected_keys = {"verdict", "reason", "summary", "impact"}
-        if not expected_keys.issubset(data.keys()):
-            logging.warning("LLMレスポンスに必要なキーが不足: %s", data.keys())
-            return None
-        return data
-
-    except json.JSONDecodeError as e:
-        logging.error("LLMレスポンスのパースに失敗: %s", e)
-        return None
-    except Exception as e:
-        logging.error("グローバル銘柄分析エラー: %s", e)
-        return None
+    return _call_llm_with_retry(analysis_context, analysis_prompt, config, label="グローバル銘柄AI分析")
 
 
 # ==========================================
@@ -956,6 +974,39 @@ def send_notifications(data, item, category, hit_words, config):
 
 
 # ==========================================
+# サマリーレポート
+# ==========================================
+def _print_summary_report(tse_analyzed, tse_total, global_analyzed, global_results):
+    """実行結果のサマリーレポートをログに出力する"""
+    logging.info("")
+    logging.info("=" * 60)
+    logging.info("  実行サマリーレポート (%s)", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    logging.info("=" * 60)
+    logging.info("  東証銘柄: %d / %d 件分析完了", tse_analyzed, tse_total)
+    logging.info("  グローバル銘柄: %d 件分析完了", global_analyzed)
+
+    if global_results:
+        ok = [r for r in global_results if r.get("status") == "ok"]
+        errors = [r for r in global_results if r.get("status") in ("error", "llm_error", "fetch_error")]
+
+        if ok:
+            logging.info("  --- グローバル分析結果 ---")
+            for r in ok:
+                logging.info(
+                    "    %s:%s -> %s (トレンド: %s)",
+                    r["ticker"], r["market"],
+                    r.get("verdict", "N/A"), r.get("trend", "N/A"),
+                )
+
+        if errors:
+            logging.info("  --- エラー ---")
+            for r in errors:
+                logging.info("    %s:%s -> %s", r["ticker"], r["market"], r["status"])
+
+    logging.info("=" * 60)
+
+
+# ==========================================
 # メイン処理
 # ==========================================
 def main():
@@ -1114,6 +1165,9 @@ def main():
     # グローバル銘柄分析パイプライン
     # ==========================================
     global_enabled = config.get("global_stock_enabled", True)
+    global_analyzed = 0
+    global_results = []  # サマリーレポート用
+
     if not global_enabled:
         logging.info("グローバル銘柄分析は無効です (global_stock_enabled=false)")
     else:
@@ -1124,18 +1178,38 @@ def main():
         else:
             logging.info("=== グローバル銘柄分析開始 (%d 銘柄) ===", len(global_tickers))
             global_sleep = config.get("global_analysis_sleep_sec", 3)
-            global_analyzed = 0
+            max_workers = min(config.get("global_fetch_workers", 4), len(global_tickers))
 
+            # Phase 1: データ取得を並列実行（I/O待ちが多いため並列化が効果的）
+            logging.info("データ取得フェーズ開始 (並列度=%d)", max_workers)
+            fetch_results = {}
+
+            def _fetch_ticker_data(t_info):
+                return t_info["ticker"], fetch_global_stock_info(t_info, config)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_fetch_ticker_data, ti): ti
+                    for ti in global_tickers
+                }
+                for future in as_completed(futures):
+                    ti = futures[future]
+                    try:
+                        ticker_key, result = future.result()
+                        fetch_results[ticker_key] = result
+                    except Exception as e:
+                        logging.error("データ取得エラー (%s): %s", ti["ticker"], e)
+
+            # Phase 2: LLM分析は逐次実行（レートリミット考慮）
             for ticker_info in global_tickers:
                 ticker = ticker_info["ticker"]
                 market = ticker_info.get("market", "US")
+                result = fetch_results.get(ticker)
 
                 try:
-                    # 全情報取得（株価・ニュース・SEC資料）
-                    result = fetch_global_stock_info(ticker_info, config)
-
                     if not result or not result.get("analysis_context"):
                         logging.warning("データ取得失敗: %s:%s", ticker, market)
+                        global_results.append({"ticker": ticker, "market": market, "status": "fetch_error"})
                         continue
 
                     stock_data = result.get("stock_data")
@@ -1152,8 +1226,8 @@ def main():
                             ticker, market, news_count, sec_count,
                         )
                         global_analyzed += 1
+                        global_results.append({"ticker": ticker, "market": market, "status": "dry_run"})
                     else:
-                        # LLM分析実行
                         analysis = analyze_global_stock(
                             result["analysis_context"],
                             result["analysis_prompt"],
@@ -1161,11 +1235,9 @@ def main():
                         )
 
                         if analysis:
-                            # 通知送信
                             send_global_notifications(analysis, ticker_info, stock_data, config)
                             global_analyzed += 1
 
-                            # Google Sheets記録
                             if sheet:
                                 row_data = [
                                     datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1195,11 +1267,18 @@ def main():
                                 analysis.get("verdict"),
                                 analysis.get("trend", "N/A"),
                             )
+                            global_results.append({
+                                "ticker": ticker, "market": market,
+                                "status": "ok", "verdict": analysis.get("verdict"),
+                                "trend": analysis.get("trend"),
+                            })
                         else:
                             logging.warning("LLM分析失敗: %s:%s", ticker, market)
+                            global_results.append({"ticker": ticker, "market": market, "status": "llm_error"})
 
                 except Exception as e:
                     logging.error("グローバル銘柄処理エラー (%s:%s): %s", ticker, market, e)
+                    global_results.append({"ticker": ticker, "market": market, "status": "error", "error": str(e)})
 
                 time.sleep(global_sleep)
 
@@ -1208,6 +1287,10 @@ def main():
                 global_analyzed, len(global_tickers),
             )
 
+    # ==========================================
+    # サマリーレポート出力
+    # ==========================================
+    _print_summary_report(analyzed_count, len(target_items), global_analyzed, global_results)
     logging.info("--- 全処理完了 ---")
 
 
