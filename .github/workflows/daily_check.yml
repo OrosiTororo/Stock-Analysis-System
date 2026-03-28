@@ -2,7 +2,9 @@ name: Stock Analysis 365
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    # 東京市場の営業時間帯に合わせて実行（JST 9:00-15:30 = UTC 0:00-6:30）
+    # 平日のみ実行する場合は別途制御が必要
+    - cron: '0 0,3,6,9,12,15,18,21 * * *'  # 3時間おき（APIコスト最適化）
   workflow_dispatch:
     inputs:
       dry_run:
@@ -35,10 +37,20 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
+      - name: Cache OCR dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/share/tesseract-ocr
+            /usr/lib/x86_64-linux-gnu/libtesseract*
+          key: ${{ runner.os }}-ocr-deps-v1
+
       - name: Install OCR dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn poppler-utils
+          if ! command -v tesseract &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn poppler-utils
+          fi
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -61,3 +73,15 @@ jobs:
           EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
           EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SEC_EDGAR_EMAIL: ${{ secrets.SEC_EDGAR_EMAIL }}
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -s -X POST "$SLACK_WEBHOOK_URL" \
+              -H 'Content-type: application/json' \
+              -d '{"text":"⚠️ Stock Analysis ワークフローが失敗しました。GitHub Actions を確認してください。"}'
+          fi
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
